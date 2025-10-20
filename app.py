@@ -528,6 +528,9 @@ HTML_TEMPLATE = """
             
             <div style="margin-top: 30px;">
                 <div class="settings-title">📁 Enable/Disable Sectors</div>
+                <div style="background: #fef3c7; padding: 12px; border-radius: 8px; margin-bottom: 15px; border-left: 4px solid #f59e0b;">
+                    <strong>⚠️ Free Tier Tip:</strong> Enable only 2-3 sectors for faster analysis and to avoid timeouts. More sectors = longer analysis time.
+                </div>
                 <div class="sector-toggles" id="sector-toggles">
                     <!-- Sectors will be populated here -->
                 </div>
@@ -956,13 +959,23 @@ def analyze():
             config = load_config()
             analyzer = LiveTradingAnalyzer(config)
         
+        # For Render free tier: limit to prevent timeout
+        enabled_sectors = analyzer.config.get('enabled_sectors', [])
+        
+        # Auto-limit on Render to prevent timeout
+        if len(enabled_sectors) > 3:
+            print("⚠️ Limiting to first 3 sectors to prevent timeout on free tier")
+            enabled_sectors = enabled_sectors[:3]
+        
         # Run analysis
+        print(f"🔍 Starting analysis on {len(enabled_sectors)} sectors...")
         results = analyzer.run_analysis(
-            enabled_sectors=analyzer.config.get('enabled_sectors'),
+            enabled_sectors=enabled_sectors,
             top_n=analyzer.config.get('top_opportunities', 20)
         )
         
         latest_results = results
+        print(f"✅ Analysis complete! Found {results['total_analyzed']} stocks")
         return jsonify(results)
     except Exception as e:
         import traceback
