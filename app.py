@@ -16,6 +16,13 @@ CORS(app)
 # Global analyzer
 analyzer = None
 latest_results = None
+analysis_progress = {'message': '', 'type': 'info'}
+
+def log_progress(message, log_type='info'):
+    """Log progress message for live viewer"""
+    global analysis_progress
+    analysis_progress = {'message': message, 'type': log_type}
+    print(f"[{log_type.upper()}] {message}")  # Also print to terminal
 
 # ============================================================================
 # HTML TEMPLATE (iPad Optimized)
@@ -419,6 +426,53 @@ HTML_TEMPLATE = """
             background: #059669;
         }
         
+        .log-viewer {
+            background: #1e293b;
+            color: #e2e8f0;
+            padding: 15px;
+            border-radius: 8px;
+            font-family: 'Monaco', 'Menlo', 'Courier New', monospace;
+            font-size: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 20px;
+            display: none;
+        }
+        
+        .log-viewer.active {
+            display: block;
+        }
+        
+        .log-line {
+            margin: 2px 0;
+            padding: 2px 0;
+        }
+        
+        .log-line.info { color: #60a5fa; }
+        .log-line.success { color: #34d399; }
+        .log-line.warning { color: #fbbf24; }
+        .log-line.error { color: #f87171; }
+        
+        .log-toggle {
+            background: #1e293b;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            margin-top: 20px;
+        }
+        
+        .log-toggle:hover {
+            background: #334155;
+        }
+        
+        .log-toggle.active {
+            background: #10b981;
+        }
+        
         @media (max-width: 768px) {
             .button-container {
                 grid-template-columns: 1fr;
@@ -475,6 +529,17 @@ HTML_TEMPLATE = """
         
         <div class="settings-panel">
             <div class="settings-title">⚙️ Settings</div>
+            
+            <button class="log-toggle" onclick="toggleLogs()">
+                📊 Show Live Logs
+            </button>
+            
+            <div class="log-viewer" id="log-viewer">
+                <div style="font-weight: 600; margin-bottom: 10px;">🔍 Live Analysis Log</div>
+                <div id="log-content">
+                    <div class="log-line info">Waiting for analysis to start...</div>
+                </div>
+            </div>
             
             <div class="settings-grid">
                 <div class="setting-item">
@@ -550,6 +615,69 @@ HTML_TEMPLATE = """
     <script>
         let currentConfig = {};
         let currentResults = null;
+        let logPollingInterval = null;
+        
+        // Log viewer functions
+        function toggleLogs() {
+            const viewer = document.getElementById('log-viewer');
+            const button = document.querySelector('.log-toggle');
+            
+            if (viewer.classList.contains('active')) {
+                viewer.classList.remove('active');
+                button.classList.remove('active');
+                button.textContent = '📊 Show Live Logs';
+                stopLogPolling();
+            } else {
+                viewer.classList.add('active');
+                button.classList.add('active');
+                button.textContent = '📊 Hide Live Logs';
+            }
+        }
+        
+        function addLog(message, type = 'info') {
+            const logContent = document.getElementById('log-content');
+            const logLine = document.createElement('div');
+            logLine.className = `log-line ${type}`;
+            const timestamp = new Date().toLocaleTimeString();
+            logLine.textContent = `[${timestamp}] ${message}`;
+            logContent.appendChild(logLine);
+            
+            // Auto-scroll to bottom
+            logContent.scrollTop = logContent.scrollHeight;
+            
+            // Keep only last 100 lines (memory efficient)
+            if (logContent.children.length > 100) {
+                logContent.removeChild(logContent.firstChild);
+            }
+        }
+        
+        function clearLogs() {
+            document.getElementById('log-content').innerHTML = '';
+        }
+        
+        function startLogPolling() {
+            // Poll for progress updates every 2 seconds during analysis
+            logPollingInterval = setInterval(async () => {
+                try {
+                    const response = await fetch('/api/analysis-progress');
+                    if (response.ok) {
+                        const progress = await response.json();
+                        if (progress.message) {
+                            addLog(progress.message, progress.type || 'info');
+                        }
+                    }
+                } catch (error) {
+                    // Silent fail - progress endpoint may not return anything
+                }
+            }, 2000);
+        }
+        
+        function stopLogPolling() {
+            if (logPollingInterval) {
+                clearInterval(logPollingInterval);
+                logPollingInterval = null;
+            }
+        }
         
         // Load initial config
         async function loadConfig() {
@@ -650,7 +778,18 @@ HTML_TEMPLATE = """
             button.classList.add('loading');
             button.innerHTML = '<span class="loading-spinner"></span> ANALYZING...';
             
+            // Clear and show logs
+            clearLogs();
+            addLog('🚀 Starting analysis...', 'info');
+            addLog(`📊 Capital: $${currentConfig.capital || 2400}`, 'info');
+            addLog(`📁 Sectors enabled: ${(currentConfig.enabled_sectors || []).length}`, 'info');
+            
+            // Start polling for progress
+            startLogPolling();
+            
             try {
+                addLog('📡 Connecting to analysis engine...', 'info');
+                
                 const response = await fetch('/api/analyze', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
@@ -659,12 +798,15 @@ HTML_TEMPLATE = """
                 if (!response.ok) {
                     const errorData = await response.json();
                     console.error('Analysis error:', errorData);
+                    addLog(`❌ Error: ${errorData.error}`, 'error');
                     alert(`❌ Error running analysis:\n\nType: ${errorData.type}\nMessage: ${errorData.error}\n\nCheck browser console (F12) for full details.`);
                     button.classList.remove('loading');
                     button.innerHTML = '<span class="button-icon">🔍</span>ANALYZE<div style="font-size: 12px; margin-top: 5px;">Run Analysis</div>';
+                    stopLogPolling();
                     return;
                 }
                 
+                addLog('📥 Receiving results...', 'info');
                 currentResults = await response.json();
                 
                 // Update regime
@@ -678,11 +820,20 @@ HTML_TEMPLATE = """
                 button.classList.remove('loading');
                 button.innerHTML = '<span class="button-icon">🔍</span>ANALYZE<div style="font-size: 12px; margin-top: 5px;">Run Analysis</div>';
                 
+                addLog(`✅ Analysis complete!`, 'success');
+                addLog(`📊 Found ${currentResults.total_analyzed} stocks`, 'success');
+                addLog(`🏆 Top opportunities: ${currentResults.top_opportunities.length}`, 'success');
+                addLog(`🌍 Market regime: ${regime.toUpperCase()}`, 'info');
+                
+                stopLogPolling();
+                
                 alert(`✅ Analysis complete! Found ${currentResults.total_analyzed} stocks. Click RESULTS to view.`);
             } catch (error) {
                 console.error('Error analyzing:', error);
                 button.classList.remove('loading');
                 button.innerHTML = '<span class="button-icon">🔍</span>ANALYZE<div style="font-size: 12px; margin-top: 5px;">Run Analysis</div>';
+                addLog(`❌ Error: ${error.message}`, 'error');
+                stopLogPolling();
                 alert(`❌ Error running analysis:\n\n${error.message}\n\nCheck terminal/console for details.`);
             }
         }
@@ -949,12 +1100,19 @@ def update_config():
     
     return jsonify({'status': 'success', 'config': config})
 
+@app.route('/api/analysis-progress', methods=['GET'])
+def get_progress():
+    """Get current analysis progress"""
+    return jsonify(analysis_progress)
+
 @app.route('/api/analyze', methods=['POST'])
 def analyze():
     """Run the analysis"""
     global analyzer, latest_results
     
     try:
+        log_progress('Initializing analyzer...', 'info')
+        
         if analyzer is None:
             config = load_config()
             analyzer = LiveTradingAnalyzer(config)
@@ -962,20 +1120,23 @@ def analyze():
         # For Render free tier: limit to prevent timeout
         enabled_sectors = analyzer.config.get('enabled_sectors', [])
         
+        log_progress(f'Sectors selected: {len(enabled_sectors)}', 'info')
+        
         # Auto-limit on Render to prevent timeout
         if len(enabled_sectors) > 3:
-            print("⚠️ Limiting to first 3 sectors to prevent timeout on free tier")
+            log_progress('⚠️ Limiting to first 3 sectors (free tier)', 'warning')
             enabled_sectors = enabled_sectors[:3]
         
+        log_progress(f'Analyzing {len(enabled_sectors)} sectors...', 'info')
+        
         # Run analysis
-        print(f"🔍 Starting analysis on {len(enabled_sectors)} sectors...")
         results = analyzer.run_analysis(
             enabled_sectors=enabled_sectors,
             top_n=analyzer.config.get('top_opportunities', 20)
         )
         
         latest_results = results
-        print(f"✅ Analysis complete! Found {results['total_analyzed']} stocks")
+        log_progress(f'✅ Complete! Analyzed {results["total_analyzed"]} stocks', 'success')
         return jsonify(results)
     except Exception as e:
         import traceback
@@ -984,6 +1145,7 @@ def analyze():
             'type': type(e).__name__,
             'traceback': traceback.format_exc()
         }
+        log_progress(f'❌ Error: {str(e)}', 'error')
         print("\n❌ ERROR DURING ANALYSIS:")
         print(error_details['traceback'])
         return jsonify(error_details), 500
