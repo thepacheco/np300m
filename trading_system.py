@@ -694,16 +694,24 @@ class LiveTradingAnalyzer:
         
         print(f"🔍 Analyzing {total_stocks} stocks across {len(sector_stocks)} sectors...\n")
         
+        analyzed_count = 0
         for sector, stocks in sector_stocks.items():
-            print(f"  Analyzing {sector}... ({len(stocks)} stocks)")
+            print(f"  📁 Analyzing {sector}... ({len(stocks)} stocks)")
             
             for symbol in stocks[:50]:  # Top 50 per sector
                 analysis = self.analyze_stock(symbol, spy_regime)
                 if analysis:
                     all_analyses.append(analysis)
+                    analyzed_count += 1
+                    
+                    # Progress update every 10 stocks
+                    if analyzed_count % 10 == 0:
+                        print(f"    ✓ Progress: {analyzed_count}/{total_stocks} stocks analyzed")
         
         # Sort by score
         all_analyses.sort(key=lambda x: x['score'], reverse=True)
+        
+        print(f"\n✅ Analysis complete! Found {len(all_analyses)} valid stocks")
         
         return {
             'market_regime': spy_regime,
