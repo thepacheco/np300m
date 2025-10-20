@@ -1,0 +1,12 @@
+# Minimal requirements - use if main requirements.txt fails
+yfinance
+pandas
+numpy
+scipy
+flask
+flask-cors
+scikit-learn
+requests
+beautifulsoup4
+lxml
+gunicorn
