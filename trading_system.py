@@ -103,18 +103,19 @@ class RegimeDetector:
     @staticmethod
     def detect_regime(spy_data: pd.DataFrame) -> dict:
         if len(spy_data) < 100:
-            return {'regime': 'unknown', 'confidence': 0, 'volatility': 0}
-        
+            return {'regime': 'unknown', 'confidence': 0, 'volatility': 0,
+                    'vix': None, 'fear_level': 'unknown'}
+
         price = float(spy_data['Close'].iloc[-1])
         ma20 = float(spy_data['Close'].rolling(20).mean().iloc[-1])
         ma50 = float(spy_data['Close'].rolling(50).mean().iloc[-1])
         ma100 = float(spy_data['Close'].rolling(100).mean().iloc[-1])
-        
+
         returns = spy_data['Close'].pct_change()
         vol20 = float(returns.rolling(20).std().iloc[-1] * np.sqrt(252))
-        
+
         mom_3m = float((price / spy_data['Close'].iloc[-60] - 1)) if len(spy_data) >= 60 else 0.0
-        
+
         if price > ma20 > ma50 > ma100 and mom_3m > 0.05:
             regime = 'strong_bull'
         elif price > ma50 and mom_3m > 0:
@@ -127,8 +128,37 @@ class RegimeDetector:
             regime = 'volatile'
         else:
             regime = 'sideways'
-        
-        return {'regime': regime, 'volatility': vol20}
+
+        # VIX — the market's fear gauge
+        vix_level = None
+        fear_level = 'unknown'
+        try:
+            vix_ticker = yf.Ticker('^VIX')
+            vix_data = vix_ticker.history(period='30d')
+            if len(vix_data) > 0:
+                vix_level = float(vix_data['Close'].iloc[-1])
+                vix_20d_avg = float(vix_data['Close'].mean())
+                if vix_level < 15:
+                    fear_level = 'greed'          # complacency — be cautious
+                elif vix_level < 20:
+                    fear_level = 'neutral'
+                elif vix_level < 30:
+                    fear_level = 'fear'           # elevated fear — watch for opportunity
+                    if regime in ('bull', 'strong_bull'):
+                        regime = 'volatile'       # override: fear trumps technicals
+                else:
+                    fear_level = 'extreme_fear'   # panic — wait for capitulation
+                    if regime not in ('strong_bear',):
+                        regime = 'volatile'
+        except Exception:
+            pass
+
+        return {
+            'regime': regime,
+            'volatility': vol20,
+            'vix': vix_level,
+            'fear_level': fear_level,
+        }
 
 # ============================================================================
 # MULTI-FACTOR ANALYZER (from your backtest.py + enhancements)
@@ -138,10 +168,11 @@ class MultiFactorAnalyzer:
     """Multi-factor analysis with enhancements"""
     
     @staticmethod
-    def calculate_factors(data: pd.DataFrame, symbol: str) -> dict:
+    def calculate_factors(data: pd.DataFrame, symbol: str,
+                          spy_data: pd.DataFrame = None) -> dict:
         if len(data) < 60:
             return None
-        
+
         try:
             price = float(data['Close'].iloc[-1])
             returns = data['Close'].pct_change()
@@ -171,11 +202,13 @@ class MultiFactorAnalyzer:
             recent_volume = float(data['Volume'].iloc[-1])
             volume_surge = recent_volume / avg_volume if avg_volume > 0 else 1.0
             
-            # RSI calculation
+            # RSI calculation — Wilder's exponential smoothing (correct method)
             delta = data['Close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
+            gain = delta.where(delta > 0, 0.0)
+            loss = -delta.where(delta < 0, 0.0)
+            avg_gain = gain.ewm(com=13, min_periods=14).mean()
+            avg_loss = loss.ewm(com=13, min_periods=14).mean()
+            rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
             current_rsi = float(rsi.iloc[-1]) if not pd.isna(rsi.iloc[-1]) else 50
             
@@ -219,7 +252,25 @@ class MultiFactorAnalyzer:
             volatility_score = max(0, min(100, 100 - vol_20d * 100))
             trend_score_final = trend_score * 100
             volume_score = min(100, max(0, 50 + (volume_surge - 1) * 50))
-            
+
+            # --- Relative Strength vs SPY (alpha signal) ---
+            rs_vs_spy = 0.0
+            weekly_trend = 'unknown'
+            try:
+                if spy_data is not None and len(spy_data) >= 60:
+                    lookback = min(60, len(data) - 1, len(spy_data) - 1)
+                    stock_ret = float(data['Close'].iloc[-1] / data['Close'].iloc[-lookback] - 1)
+                    spy_ret = float(spy_data['Close'].iloc[-1] / spy_data['Close'].iloc[-lookback] - 1)
+                    rs_vs_spy = stock_ret - spy_ret  # positive = outperforming
+
+                # Weekly trend confirmation (resample daily → weekly)
+                weekly = data['Close'].resample('W').last().dropna()
+                if len(weekly) >= 20:
+                    w_ma20 = float(weekly.rolling(20).mean().iloc[-1])
+                    weekly_trend = 'bullish' if float(weekly.iloc[-1]) > w_ma20 else 'bearish'
+            except Exception:
+                pass
+
             return {
                 'momentum': {
                     '1m': mom_1m,
@@ -234,12 +285,14 @@ class MultiFactorAnalyzer:
                     'score': trend_score_final,
                     'ma10': ma10,
                     'ma20': ma20,
-                    'ma50': ma50
+                    'ma50': ma50,
+                    'weekly': weekly_trend,
                 },
                 'volume': {
                     'surge': volume_surge,
                     'score': volume_score
                 },
+                'relative_strength_vs_spy': rs_vs_spy,
                 'rsi': current_rsi,
                 'macd': {
                     'value': current_macd,
@@ -277,15 +330,28 @@ class MultiFactorAnalyzer:
             'trend': 0.30,
             'volume': 0.15
         }
-        
+
         # Adjust for regime
         if regime in ['strong_bull', 'bull']:
             weights['momentum'] = 0.45
             weights['trend'] = 0.30
+            weights['volatility'] = 0.15
+            weights['volume'] = 0.10
         elif regime in ['strong_bear', 'bear']:
             weights['volatility'] = 0.35
             weights['momentum'] = 0.20
-        
+            weights['trend'] = 0.30
+            weights['volume'] = 0.15
+        elif regime == 'volatile':
+            weights['volatility'] = 0.35
+            weights['momentum'] = 0.25
+            weights['trend'] = 0.25
+            weights['volume'] = 0.15
+
+        # Normalize weights so they always sum exactly to 1.0
+        total_weight = sum(weights.values())
+        weights = {k: v / total_weight for k, v in weights.items()}
+
         score = sum(factors[f]['score'] * w for f, w in weights.items())
         return score
 
@@ -429,6 +495,228 @@ class NewsSentimentAnalyzer:
             }
         except Exception as e:
             return {'sentiment': 'neutral', 'score': 0, 'news_count': 0, 'error': str(e)}
+
+# ============================================================================
+# FUNDAMENTAL ANALYZER
+# ============================================================================
+
+class FundamentalAnalyzer:
+    """Score stocks on fundamental quality metrics available via yfinance"""
+
+    @staticmethod
+    def score(info: dict) -> dict:
+        """Return 0-100 score and list of signal strings"""
+        pts = 50  # neutral baseline
+        signals = []
+
+        # --- Valuation ---
+        pe = info.get('trailingPE')
+        forward_pe = info.get('forwardPE')
+        peg = info.get('pegRatio')
+
+        if pe and pe > 0:
+            if pe < 15:
+                pts += 10; signals.append(f'Low P/E {pe:.1f} (value)')
+            elif pe < 25:
+                pts += 5; signals.append(f'Moderate P/E {pe:.1f}')
+            elif pe > 50:
+                pts -= 10; signals.append(f'Stretched P/E {pe:.1f}')
+        elif pe and pe < 0:
+            pts -= 5; signals.append('Negative earnings (loss-making)')
+
+        if peg and peg > 0:
+            if peg < 1.0:
+                pts += 10; signals.append(f'PEG {peg:.2f} — growth at a discount')
+            elif peg < 2.0:
+                pts += 5
+            elif peg > 3.0:
+                pts -= 5; signals.append(f'PEG {peg:.2f} — expensive for growth')
+
+        # Forward P/E improving (lower than trailing = earnings growing)
+        if pe and forward_pe and pe > 0 and forward_pe > 0:
+            if forward_pe < pe * 0.85:
+                pts += 8; signals.append('Earnings expected to grow significantly')
+            elif forward_pe > pe * 1.15:
+                pts -= 5; signals.append('Earnings expected to decline')
+
+        # --- Growth ---
+        rev_growth = info.get('revenueGrowth')
+        earn_growth = info.get('earningsGrowth')
+
+        if rev_growth is not None:
+            if rev_growth > 0.25:
+                pts += 12; signals.append(f'Revenue +{rev_growth*100:.0f}% YoY')
+            elif rev_growth > 0.10:
+                pts += 7; signals.append(f'Revenue +{rev_growth*100:.0f}% YoY')
+            elif rev_growth > 0:
+                pts += 3
+            elif rev_growth < -0.10:
+                pts -= 10; signals.append(f'Revenue declining {rev_growth*100:.0f}%')
+
+        if earn_growth is not None:
+            if earn_growth > 0.25:
+                pts += 10; signals.append(f'Earnings +{earn_growth*100:.0f}% YoY')
+            elif earn_growth > 0.10:
+                pts += 5
+            elif earn_growth < 0:
+                pts -= 8; signals.append('Earnings declining YoY')
+
+        # --- Profitability ---
+        roe = info.get('returnOnEquity')
+        margin = info.get('profitMargins')
+
+        if roe is not None:
+            if roe > 0.25:
+                pts += 8; signals.append(f'ROE {roe*100:.0f}% (high quality)')
+            elif roe > 0.15:
+                pts += 4
+            elif roe < 0:
+                pts -= 8; signals.append('Negative ROE')
+
+        if margin is not None:
+            if margin > 0.20:
+                pts += 5; signals.append(f'Strong margin {margin*100:.0f}%')
+            elif margin < 0:
+                pts -= 5; signals.append('Unprofitable')
+
+        # --- Balance sheet ---
+        de = info.get('debtToEquity')
+        if de is not None:
+            if de < 30:
+                pts += 5; signals.append('Low debt / strong balance sheet')
+            elif de > 300:
+                pts -= 8; signals.append(f'High debt load D/E {de:.0f}')
+
+        return {
+            'score': max(0, min(100, pts)),
+            'signals': signals,
+            'pe': pe,
+            'forward_pe': forward_pe,
+            'peg': peg,
+            'revenue_growth': rev_growth,
+            'earnings_growth': earn_growth,
+            'roe': roe,
+            'profit_margin': margin,
+            'debt_equity': de,
+        }
+
+
+# ============================================================================
+# HUMAN BEHAVIOR ANALYZER
+# ============================================================================
+
+class HumanBehaviorAnalyzer:
+    """
+    Model what informed humans are doing around this stock:
+    - Analyst consensus (Wall St. opinion)
+    - Analyst price target upside (money on the line)
+    - Short interest (contrarian squeeze setup or vote of no confidence)
+    - Insider ownership (management skin in the game)
+    - Institutional conviction (smart money)
+    """
+
+    @staticmethod
+    def score(info: dict) -> dict:
+        pts = 50  # neutral baseline
+        signals = []
+
+        current = info.get('currentPrice') or info.get('regularMarketPrice')
+
+        # --- Analyst consensus (1=Strong Buy … 5=Strong Sell) ---
+        reco_mean = info.get('recommendationMean')
+        analyst_count = info.get('numberOfAnalystOpinions') or 0
+
+        if reco_mean and analyst_count >= 5:
+            if reco_mean <= 1.5:
+                pts += 18; signals.append(f'Strong Buy consensus — {analyst_count} analysts')
+            elif reco_mean <= 2.0:
+                pts += 12; signals.append(f'Buy consensus — {analyst_count} analysts')
+            elif reco_mean <= 2.5:
+                pts += 6; signals.append(f'Moderate Buy — {analyst_count} analysts')
+            elif reco_mean >= 4.0:
+                pts -= 12; signals.append(f'Sell consensus — {analyst_count} analysts')
+            elif reco_mean >= 3.5:
+                pts -= 6; signals.append(f'Underperform — {analyst_count} analysts')
+
+        # --- Analyst price target upside ---
+        target = info.get('targetMeanPrice')
+        if target and current and current > 0:
+            upside = (target - current) / current
+            if upside > 0.25:
+                pts += 15; signals.append(f'Analyst target implies +{upside*100:.0f}% upside')
+            elif upside > 0.15:
+                pts += 10; signals.append(f'Analyst target +{upside*100:.0f}% upside')
+            elif upside > 0.05:
+                pts += 5; signals.append(f'Analyst target +{upside*100:.0f}% upside')
+            elif upside < -0.10:
+                pts -= 10; signals.append(f'Analyst target implies {upside*100:.0f}% downside')
+        else:
+            upside = None
+
+        # --- Short interest ---
+        short_pct = info.get('shortPercentOfFloat') or 0.0
+        short_ratio = info.get('shortRatio') or 0.0  # days to cover
+
+        if short_pct > 0.25:
+            pts += 8; signals.append(f'High short interest {short_pct*100:.0f}% — squeeze potential')
+        elif short_pct > 0.15:
+            pts += 3; signals.append(f'Elevated short interest {short_pct*100:.0f}%')
+        elif short_pct < 0.02:
+            pts += 4; signals.append('Very low short interest — broadly liked')
+
+        # --- Insider ownership (skin in the game) ---
+        insider_pct = info.get('heldPercentInsiders') or 0.0
+        if insider_pct > 0.15:
+            pts += 8; signals.append(f'Insiders own {insider_pct*100:.0f}% — aligned')
+        elif insider_pct > 0.05:
+            pts += 4; signals.append(f'Insiders own {insider_pct*100:.0f}%')
+
+        # --- Institutional ownership (smart money conviction) ---
+        inst_pct = info.get('heldPercentInstitutions') or 0.0
+        if inst_pct > 0.75:
+            pts += 6; signals.append(f'Strong institutional ownership {inst_pct*100:.0f}%')
+        elif inst_pct > 0.50:
+            pts += 3
+        elif inst_pct < 0.25:
+            pts -= 4; signals.append('Weak institutional interest')
+
+        # --- Beta (regime-context is handled at score wire-up) ---
+        beta = info.get('beta') or 1.0
+
+        return {
+            'score': max(0, min(100, pts)),
+            'signals': signals,
+            'analyst_consensus': reco_mean,
+            'analyst_count': analyst_count,
+            'price_target_upside': upside,
+            'short_pct_float': short_pct,
+            'short_ratio': short_ratio,
+            'insider_pct': insider_pct,
+            'institutional_pct': inst_pct,
+            'beta': beta,
+        }
+
+    @staticmethod
+    def is_near_earnings(symbol: str) -> bool:
+        """Return True if earnings are within 7 calendar days — skip these setups."""
+        try:
+            ticker = yf.Ticker(symbol)
+            cal = ticker.calendar
+            if cal is None:
+                return False
+            # yfinance returns calendar as a dict in newer versions
+            if isinstance(cal, dict):
+                dates = cal.get('Earnings Date', [])
+                if dates:
+                    nxt = pd.Timestamp(dates[0] if isinstance(dates, (list, tuple)) else dates)
+                    return 0 <= (nxt - pd.Timestamp.now()).days <= 7
+            elif hasattr(cal, 'columns') and 'Earnings Date' in cal.columns:
+                nxt = pd.Timestamp(cal['Earnings Date'].iloc[0])
+                return 0 <= (nxt - pd.Timestamp.now()).days <= 7
+        except Exception:
+            pass
+        return False
+
 
 # ============================================================================
 # PREDICTION ENGINE
@@ -611,6 +899,8 @@ class LiveTradingAnalyzer:
         self.factor_analyzer = MultiFactorAnalyzer()
         self.pattern_detector = CandlestickPatternDetector()
         self.news_analyzer = NewsSentimentAnalyzer()
+        self.fundamental_analyzer = FundamentalAnalyzer()
+        self.behavior_analyzer = HumanBehaviorAnalyzer()
         self.prediction_engine = PredictionEngine()
         
     def get_sector_stocks(self, enabled_sectors=None):
@@ -625,50 +915,86 @@ class LiveTradingAnalyzer:
         
         return stocks
     
-    def analyze_stock(self, symbol: str, spy_regime: dict) -> dict:
+    def analyze_stock(self, symbol: str, spy_regime: dict,
+                      spy_data: pd.DataFrame = None) -> dict:
         """Complete analysis for a single stock"""
-        
+
         try:
             # Download data
             stock = yf.Ticker(symbol)
             data = stock.history(period='1y')
-            
+
             if len(data) < 60:
                 return None
-            
-            # Calculate factors
-            factors = self.factor_analyzer.calculate_factors(data, symbol)
+
+            # Get company info once (used by fundamental + behavior layers)
+            info = stock.info
+
+            # --- Earnings avoidance ---
+            near_earnings = self.behavior_analyzer.is_near_earnings(symbol)
+
+            # --- Technical factors (now includes relative strength + weekly trend) ---
+            factors = self.factor_analyzer.calculate_factors(data, symbol, spy_data)
             if not factors:
                 return None
-            
-            # Composite score
-            score = self.factor_analyzer.composite_score(factors, spy_regime['regime'])
-            
-            # Candlestick patterns
+
+            # --- Fundamental layer ---
+            fundamental = self.fundamental_analyzer.score(info)
+
+            # --- Human behavior layer ---
+            behavior = self.behavior_analyzer.score(info)
+
+            # --- Technical composite (existing logic, now with fixed weights) ---
+            tech_score = self.factor_analyzer.composite_score(factors, spy_regime['regime'])
+
+            # --- Enhanced composite score ---
+            # 50% technical · 25% fundamental · 25% human behavior
+            raw_score = tech_score * 0.50 + fundamental['score'] * 0.25 + behavior['score'] * 0.25
+
+            # Relative strength bonus: outperforming SPY by >5% adds up to +8 pts
+            rs = factors.get('relative_strength_vs_spy', 0.0)
+            rs_bonus = max(-8.0, min(8.0, rs * 80))
+            raw_score += rs_bonus
+
+            # Weekly trend must agree with daily for full credit; disagreement docks 5 pts
+            if factors['trend']['weekly'] == 'bearish' and tech_score > 60:
+                raw_score -= 5  # daily bullish but weekly bearish → reduce confidence
+            elif factors['trend']['weekly'] == 'bullish' and tech_score > 50:
+                raw_score += 3  # multi-timeframe alignment bonus
+
+            # Earnings proximity penalty — don't buy into unknown binary events
+            if near_earnings:
+                raw_score -= 15
+
+            score = max(0.0, min(100.0, raw_score))
+
+            # --- Candlestick patterns ---
             patterns = self.pattern_detector.detect_patterns(data)
-            
-            # News sentiment
+
+            # --- News sentiment ---
             news = self.news_analyzer.get_sentiment(symbol)
-            
-            # Predictions
+
+            # --- Price predictions ---
             predictions = self.prediction_engine.predict_targets(data, factors, spy_regime['regime'])
-            
-            # Get company info
-            info = stock.info
-            
+
             return {
                 'symbol': symbol,
                 'company_name': info.get('longName', symbol),
                 'sector': info.get('sector', 'Unknown'),
                 'current_price': float(data['Close'].iloc[-1]),
                 'score': score,
+                'tech_score': tech_score,
+                'fundamental': fundamental,
+                'behavior': behavior,
+                'relative_strength_vs_spy': rs,
+                'near_earnings': near_earnings,
                 'factors': factors,
                 'patterns': patterns,
                 'news': news,
                 'predictions': predictions,
-                'regime': spy_regime['regime']
+                'regime': spy_regime['regime'],
             }
-            
+
         except Exception as e:
             print(f"Error analyzing {symbol}: {e}")
             return None
@@ -699,7 +1025,7 @@ class LiveTradingAnalyzer:
             print(f"  📁 Analyzing {sector}... ({len(stocks)} stocks)")
             
             for symbol in stocks[:50]:  # Top 50 per sector
-                analysis = self.analyze_stock(symbol, spy_regime)
+                analysis = self.analyze_stock(symbol, spy_regime, spy_data)
                 if analysis:
                     all_analyses.append(analysis)
                     analyzed_count += 1
@@ -723,45 +1049,88 @@ class LiveTradingAnalyzer:
     
     def format_recommendation(self, analysis: dict, capital: float) -> dict:
         """Format a trading recommendation with position sizing"""
-        
+
         predictions = analysis['predictions']
         current_price = analysis['current_price']
-        
+        factors = analysis['factors']
+
         # Position size (configurable % of capital)
         position_pct = self.config.get('position_size_pct', 10) / 100
         position_value = capital * position_pct
         shares = int(position_value / current_price)
-        
+
         if shares == 0:
             shares = 1  # Minimum 1 share
-        
+
         actual_position = shares * current_price
-        
-        # Stop loss and take profit
+
+        # --- ATR-based dynamic stop loss (2× ATR below entry) ---
+        # Much better than a fixed %, because it adapts to each stock's volatility.
+        # Volatile stocks need wider stops; calm stocks can be tighter.
+        try:
+            import yfinance as yf
+            _ticker = yf.Ticker(analysis['symbol'])
+            _data = _ticker.history(period='30d')
+            hl = _data['High'] - _data['Low']
+            hc = abs(_data['High'] - _data['Close'].shift())
+            lc = abs(_data['Low'] - _data['Close'].shift())
+            tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+            atr_14 = float(tr.rolling(14).mean().iloc[-1])
+            atr_stop = current_price - (atr_14 * 2.0)   # 2 ATR stop
+            atr_take = current_price + (atr_14 * 4.0)   # 4 ATR target (2:1 RR minimum)
+        except Exception:
+            atr_14 = None
+            atr_stop = None
+            atr_take = None
+
+        # Fall back to config % if ATR unavailable
         stop_loss_pct = self.config.get('stop_loss_pct', 5) / 100
         take_profit_pct = self.config.get('take_profit_pct', 10) / 100
-        
-        stop_loss = current_price * (1 - stop_loss_pct)
-        take_profit = current_price * (1 + take_profit_pct)
-        
-        # Build reasoning
+        stop_loss = atr_stop if atr_stop else current_price * (1 - stop_loss_pct)
+        take_profit = atr_take if atr_take else current_price * (1 + take_profit_pct)
+
+        # --- Build reasoning ---
         reasoning_parts = [predictions['reasoning']]
-        
-        # Add pattern info
+
+        # Fundamental signals
+        fundamental = analysis.get('fundamental', {})
+        for sig in fundamental.get('signals', [])[:3]:
+            reasoning_parts.append(sig)
+
+        # Human behavior signals
+        behavior = analysis.get('behavior', {})
+        for sig in behavior.get('signals', [])[:3]:
+            reasoning_parts.append(sig)
+
+        # Relative strength
+        rs = analysis.get('relative_strength_vs_spy', 0.0)
+        if abs(rs) > 0.03:
+            direction = 'outperforming' if rs > 0 else 'underperforming'
+            reasoning_parts.append(f'{direction} SPY by {abs(rs)*100:.1f}% (60d)')
+
+        # Weekly trend alignment
+        weekly = factors['trend'].get('weekly', 'unknown')
+        if weekly != 'unknown':
+            reasoning_parts.append(f'Weekly trend: {weekly}')
+
+        # Earnings warning
+        if analysis.get('near_earnings'):
+            reasoning_parts.append('EARNINGS SOON — elevated binary risk')
+
+        # Candlestick patterns
         if analysis['patterns']:
             pattern_names = [p['pattern'] for p in analysis['patterns']]
             reasoning_parts.append(f"Patterns: {', '.join(pattern_names)}")
-        
-        # Add news sentiment
+
+        # News sentiment
         if analysis['news']['sentiment'] != 'neutral':
-            reasoning_parts.append(f"News sentiment: {analysis['news']['sentiment']}")
-        
-        # Add price levels
-        factors = analysis['factors']
+            reasoning_parts.append(f"News: {analysis['news']['sentiment']}")
+
+        # 52-week levels
         dist_from_high = factors['price_levels']['distance_from_high']
         dist_from_low = factors['price_levels']['distance_from_low']
         reasoning_parts.append(f"52w High: {dist_from_high:+.1f}%, 52w Low: {dist_from_low:+.1f}%")
-        
+
         return {
             'symbol': analysis['symbol'],
             'company': analysis['company_name'],
@@ -771,6 +1140,7 @@ class LiveTradingAnalyzer:
             'position_value': actual_position,
             'stop_loss': stop_loss,
             'take_profit': take_profit,
+            'atr_14': atr_14,
             'targets': {
                 'today_high': predictions['predictions']['today']['target_high'],
                 'today_low': predictions['predictions']['today']['target_low'],
@@ -779,12 +1149,18 @@ class LiveTradingAnalyzer:
                 'month': predictions['predictions']['month']['target']
             },
             'score': analysis['score'],
+            'tech_score': analysis.get('tech_score', analysis['score']),
+            'fundamental_score': fundamental.get('score', 50),
+            'behavior_score': behavior.get('score', 50),
             'rsi': factors['rsi'],
             'momentum_1m': factors['momentum']['1m'],
+            'relative_strength_vs_spy': rs,
+            'near_earnings': analysis.get('near_earnings', False),
+            'weekly_trend': weekly,
             'patterns': [p['pattern'] for p in analysis['patterns']],
             'news_sentiment': analysis['news']['sentiment'],
             'reasoning': ' | '.join(reasoning_parts),
-            'regime': analysis['regime']
+            'regime': analysis['regime'],
         }
 
 # ============================================================================
