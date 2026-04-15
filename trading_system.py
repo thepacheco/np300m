@@ -11,10 +11,46 @@ import pandas as pd
 import numpy as np
 import json
 import os
+import time
+import threading
 from datetime import datetime, timedelta
 from scipy import stats
 import warnings
 warnings.filterwarnings('ignore')
+
+# ---------------------------------------------------------------------------
+# Resilient yfinance helpers
+# ---------------------------------------------------------------------------
+
+def _run_with_timeout(fn, timeout: int = 12, default=None):
+    """Run fn() in a daemon thread; return default if it exceeds timeout."""
+    result = [default]
+    def _target():
+        try:
+            result[0] = fn()
+        except Exception:
+            pass
+    t = threading.Thread(target=_target, daemon=True)
+    t.start()
+    t.join(timeout)
+    return result[0]
+
+def _safe_info(symbol: str, timeout: int = 10) -> dict:
+    """Fetch yfinance .info with timeout + graceful fallback."""
+    def _fetch():
+        return yf.Ticker(symbol).info
+    info = _run_with_timeout(_fetch, timeout=timeout, default={})
+    return info if info else {}
+
+def _safe_news(symbol: str, timeout: int = 6) -> list:
+    def _fetch():
+        return yf.Ticker(symbol).news or []
+    return _run_with_timeout(_fetch, timeout=timeout, default=[])
+
+def _safe_calendar(symbol: str, timeout: int = 8):
+    def _fetch():
+        return yf.Ticker(symbol).calendar
+    return _run_with_timeout(_fetch, timeout=timeout, default=None)
 
 # ============================================================================
 # SECTOR DEFINITIONS - Top 50 stocks per sector
@@ -92,6 +128,90 @@ SECTORS = {
         'CPK', 'UGI', 'BKH', 'NWN', 'SJW', 'MSEX', 'YORW', 'AWR', 'CWT', 'WTRG'
     ]
 }
+
+# ============================================================================
+# DYNAMIC TICKER LOADER
+# ============================================================================
+
+class DynamicTickerLoader:
+    """
+    Fetches live S&P 500 components from Wikipedia and organises them by
+    GICS sector.  Falls back to the static SECTORS dict if the network call
+    fails or returns garbage.  Result is cached for 24 hours.
+    """
+    _cache: dict = {}
+    _cache_ts: float = 0.0
+    _TTL: int = 86_400  # 24 hours
+
+    # Wikipedia GICS → our internal sector names
+    _SECTOR_MAP = {
+        'Information Technology':  'Technology',
+        'Health Care':             'Healthcare',
+        'Financials':              'Financial',
+        'Consumer Discretionary':  'Consumer_Cyclical',
+        'Consumer Staples':        'Consumer_Defensive',
+        'Energy':                  'Energy',
+        'Industrials':             'Industrials',
+        'Materials':               'Materials',
+        'Real Estate':             'Real_Estate',
+        'Utilities':               'Utilities',
+        'Communication Services':  'Communication',
+    }
+
+    @classmethod
+    def get_sectors(cls, force: bool = False) -> dict:
+        """Return sector → [tickers] mapping, live or cached."""
+        if not force and cls._cache and (time.time() - cls._cache_ts) < cls._TTL:
+            return cls._cache
+
+        sectors = cls._fetch_wikipedia()
+        if sectors:
+            cls._cache = sectors
+            cls._cache_ts = time.time()
+            print(f"[DynamicTickerLoader] Loaded {sum(len(v) for v in sectors.values())} live tickers")
+            return sectors
+
+        print("[DynamicTickerLoader] Falling back to static SECTORS")
+        return SECTORS
+
+    @classmethod
+    def _fetch_wikipedia(cls) -> dict:
+        try:
+            tables = pd.read_html(
+                'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies',
+                header=0,
+                flavor='lxml',
+            )
+            df = tables[0]
+            # Normalise column names (Wikipedia occasionally reformats the table)
+            df.columns = [c.strip() for c in df.columns]
+            symbol_col = next((c for c in df.columns if 'Symbol' in c or 'Ticker' in c), None)
+            sector_col = next((c for c in df.columns if 'GICS Sector' in c or 'Sector' in c), None)
+            if symbol_col is None or sector_col is None:
+                return {}
+
+            df[symbol_col] = df[symbol_col].str.strip().str.replace('.', '-', regex=False)
+            sectors: dict = {}
+            for _, row in df.iterrows():
+                ticker      = str(row[symbol_col]).strip()
+                wiki_sector = str(row[sector_col]).strip()
+                our_sector  = cls._SECTOR_MAP.get(wiki_sector, wiki_sector.replace(' ', '_'))
+                sectors.setdefault(our_sector, [])
+                if ticker not in sectors[our_sector]:
+                    sectors[our_sector].append(ticker)
+
+            # Merge with static list so we never lose any hand-curated tickers
+            for sector, tickers in SECTORS.items():
+                sectors.setdefault(sector, [])
+                for t in tickers:
+                    if t not in sectors[sector]:
+                        sectors[sector].append(t)
+
+            return sectors if sectors else {}
+        except Exception as e:
+            print(f"[DynamicTickerLoader] Wikipedia fetch error: {e}")
+            return {}
+
 
 # ============================================================================
 # REGIME DETECTOR (from your backtest.py)
@@ -465,9 +585,8 @@ class NewsSentimentAnalyzer:
     @staticmethod
     def get_sentiment(symbol: str) -> dict:
         try:
-            ticker = yf.Ticker(symbol)
-            news = ticker.news
-            
+            news = _safe_news(symbol, timeout=6)
+
             if not news:
                 return {'sentiment': 'neutral', 'score': 0, 'news_count': 0}
             
@@ -700,11 +819,9 @@ class HumanBehaviorAnalyzer:
     def is_near_earnings(symbol: str) -> bool:
         """Return True if earnings are within 7 calendar days — skip these setups."""
         try:
-            ticker = yf.Ticker(symbol)
-            cal = ticker.calendar
+            cal = _safe_calendar(symbol, timeout=8)
             if cal is None:
                 return False
-            # yfinance returns calendar as a dict in newer versions
             if isinstance(cal, dict):
                 dates = cal.get('Earnings Date', [])
                 if dates:
@@ -883,7 +1000,8 @@ class PredictionEngine:
             'action': action,
             'reasoning': reasoning,
             'confidence': 'medium' if abs(dampened_momentum) > 0.05 else 'low',
-            'detailed_explanation': '\n'.join(prediction_explanation)
+            'detailed_explanation': '\n'.join(prediction_explanation),
+            'atr_14': float(atr),   # expose so format_recommendation needs no extra download
         }
 
 # ============================================================================
@@ -916,19 +1034,33 @@ class LiveTradingAnalyzer:
         return stocks
     
     def analyze_stock(self, symbol: str, spy_regime: dict,
-                      spy_data: pd.DataFrame = None) -> dict:
-        """Complete analysis for a single stock"""
+                      spy_data: pd.DataFrame = None,
+                      prefetched_data: pd.DataFrame = None) -> dict:
+        """Complete analysis for a single stock.
 
+        prefetched_data  — 1-year OHLCV already downloaded by run_analysis()
+                           batch call; avoids a redundant per-stock request.
+        """
         try:
-            # Download data
-            stock = yf.Ticker(symbol)
-            data = stock.history(period='1y')
+            # ── Price data ──────────────────────────────────────────────────
+            if prefetched_data is not None and len(prefetched_data) >= 60:
+                data = prefetched_data.copy()
+            else:
+                # Individual fallback with 2 retries
+                data = None
+                for attempt in range(3):
+                    try:
+                        data = yf.Ticker(symbol).history(period='1y')
+                        if len(data) >= 60:
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.5 * (attempt + 1))
+                if data is None or len(data) < 60:
+                    return None
 
-            if len(data) < 60:
-                return None
-
-            # Get company info once (used by fundamental + behavior layers)
-            info = stock.info
+            # ── Company info (with timeout so it never hangs) ────────────
+            info = _safe_info(symbol, timeout=10)
 
             # --- Earnings avoidance ---
             near_earnings = self.behavior_analyzer.is_near_earnings(symbol)
@@ -968,6 +1100,16 @@ class LiveTradingAnalyzer:
 
             score = max(0.0, min(100.0, raw_score))
 
+            # --- Confidence tier (multi-signal confirmation for stronger wins) ---
+            confidence_tier = self._confidence_tier(
+                score=score,
+                factors=factors,
+                rs=rs,
+                near_earnings=near_earnings,
+                fundamental=fundamental,
+                behavior=behavior,
+            )
+
             # --- Candlestick patterns ---
             patterns = self.pattern_detector.detect_patterns(data)
 
@@ -984,6 +1126,7 @@ class LiveTradingAnalyzer:
                 'current_price': float(data['Close'].iloc[-1]),
                 'score': score,
                 'tech_score': tech_score,
+                'confidence_tier': confidence_tier,
                 'fundamental': fundamental,
                 'behavior': behavior,
                 'relative_strength_vs_spy': rs,
@@ -999,45 +1142,141 @@ class LiveTradingAnalyzer:
             print(f"Error analyzing {symbol}: {e}")
             return None
     
+    @staticmethod
+    def _confidence_tier(score, factors, rs, near_earnings, fundamental, behavior) -> str:
+        """
+        Multi-signal confirmation gate.
+        'strong'   → Pick For Me shows this; requires 7+ checks AND score ≥ 70
+        'moderate' → shown in All Results; 5+ checks AND score ≥ 62
+        'weak'     → filtered out of top picks; too many conflicting signals
+        """
+        if score < 55:
+            return 'weak'
+        if near_earnings:
+            return 'weak'   # binary event risk always disqualifies
+
+        checks = 0
+        mom1m  = factors.get('momentum', {}).get('1m', 0)
+        mom3m  = factors.get('momentum', {}).get('3m', 0)
+        rsi    = factors.get('rsi', 50)
+        trend  = factors.get('trend', {}).get('score', 0)
+        weekly = factors.get('trend', {}).get('weekly', 'unknown')
+        vol_surge = factors.get('volume', {}).get('surge', 1.0)
+
+        if 30 < rsi < 68:          checks += 1   # not overbought, not in freefall
+        if mom1m > 0.01:           checks += 1   # positive last-month momentum
+        if mom3m > 0:              checks += 1   # positive 3-month trend
+        if trend > 60:             checks += 1   # price above key MAs
+        if weekly == 'bullish':    checks += 1   # weekly chart aligned
+        if rs > 0.02:              checks += 1   # outperforming SPY
+        if vol_surge > 1.2:        checks += 1   # above-average volume (accumulation)
+        if fundamental.get('score', 50) > 58: checks += 1
+        if behavior.get('score',   50) > 58:  checks += 1
+
+        if checks >= 7 and score >= 70:
+            return 'strong'
+        elif checks >= 5 and score >= 62:
+            return 'moderate'
+        return 'weak'
+
     def run_analysis(self, enabled_sectors=None, top_n=10):
-        """Run analysis on all stocks and return top opportunities"""
-        
+        """
+        Run analysis on all stocks and return top opportunities.
+
+        Uses yf.download() per sector (one batch call for all prices)
+        instead of one call per stock — dramatically faster and avoids
+        Yahoo Finance rate-limit errors with multiple sectors.
+        """
         print("🔄 Analyzing market regime...")
-        
-        # Get SPY data for regime detection
-        spy = yf.Ticker('SPY')
-        spy_data = spy.history(period='1y')
+
+        # SPY for regime + relative-strength baseline
+        spy_data = yf.download('SPY', period='1y', progress=False, auto_adjust=True)
+        if spy_data.empty:
+            spy_data = yf.Ticker('SPY').history(period='1y')
         spy_regime = self.regime_detector.detect_regime(spy_data)
-        
+
         print(f"📊 Market Regime: {spy_regime['regime'].upper()}")
-        print(f"🌊 Volatility: {spy_regime['volatility']:.1%}\n")
-        
-        # Get stocks to analyze
-        sector_stocks = self.get_sector_stocks(enabled_sectors)
-        
+        print(f"🌊 Volatility:    {spy_regime['volatility']:.1%}")
+        if spy_regime.get('vix'):
+            print(f"😨 VIX:           {spy_regime['vix']:.1f}  ({spy_regime['fear_level']})")
+        print()
+
+        # Resolve sector → ticker mapping (dynamic or static)
+        use_dynamic = self.config.get('use_dynamic_tickers', False)
+        if use_dynamic:
+            all_sector_stocks = DynamicTickerLoader.get_sectors()
+        else:
+            all_sector_stocks = SECTORS
+
+        sector_stocks = {}
+        for s in (enabled_sectors or list(all_sector_stocks.keys())):
+            if s in all_sector_stocks:
+                sector_stocks[s] = all_sector_stocks[s]
+
         all_analyses = []
-        total_stocks = sum(len(stocks) for stocks in sector_stocks.values())
-        
-        print(f"🔍 Analyzing {total_stocks} stocks across {len(sector_stocks)} sectors...\n")
-        
+        total_stocks = sum(len(v) for v in sector_stocks.values())
+        print(f"🔍 Scanning {total_stocks} stocks across {len(sector_stocks)} sector(s)…\n")
+
         analyzed_count = 0
         for sector, stocks in sector_stocks.items():
-            print(f"  📁 Analyzing {sector}... ({len(stocks)} stocks)")
-            
-            for symbol in stocks[:50]:  # Top 50 per sector
-                analysis = self.analyze_stock(symbol, spy_regime, spy_data)
-                if analysis:
-                    all_analyses.append(analysis)
-                    analyzed_count += 1
-                    
-                    # Progress update every 10 stocks
-                    if analyzed_count % 10 == 0:
-                        print(f"    ✓ Progress: {analyzed_count}/{total_stocks} stocks analyzed")
-        
-        # Sort by score
-        all_analyses.sort(key=lambda x: x['score'], reverse=True)
-        
-        print(f"\n✅ Analysis complete! Found {len(all_analyses)} valid stocks")
+            symbols = stocks[:50]
+            print(f"  📁 {sector} — batch downloading {len(symbols)} tickers…")
+
+            # ── One network round-trip for the whole sector ──────────────
+            batch_data: dict = {}
+            try:
+                raw = yf.download(
+                    symbols,
+                    period='1y',
+                    group_by='ticker',
+                    auto_adjust=True,
+                    threads=True,
+                    progress=False,
+                )
+                if not raw.empty:
+                    if len(symbols) == 1:
+                        # Single-ticker download is flat (no ticker level)
+                        sym_df = raw.dropna(subset=['Close'])
+                        if len(sym_df) >= 60:
+                            batch_data[symbols[0]] = sym_df
+                    else:
+                        for sym in symbols:
+                            try:
+                                sym_df = raw[sym].dropna(subset=['Close'])
+                                if len(sym_df) >= 60:
+                                    batch_data[sym] = sym_df
+                            except (KeyError, TypeError):
+                                pass
+                print(f"    ✓ Batch loaded {len(batch_data)}/{len(symbols)} stocks")
+            except Exception as e:
+                print(f"    ⚠ Batch download error ({e}) — will fall back per-stock")
+
+            # ── Analyse each stock ────────────────────────────────────────
+            for symbol in symbols:
+                try:
+                    analysis = self.analyze_stock(
+                        symbol, spy_regime, spy_data,
+                        prefetched_data=batch_data.get(symbol),
+                    )
+                    if analysis:
+                        all_analyses.append(analysis)
+                        analyzed_count += 1
+                        if analyzed_count % 20 == 0:
+                            print(f"    ✓ Progress: {analyzed_count}/{total_stocks}")
+                except Exception as e:
+                    print(f"    ⚠ Skipping {symbol}: {e}")
+                    continue
+
+            # Brief pause between sectors to be kind to Yahoo Finance
+            time.sleep(1.5)
+
+        # Sort: strong confidence first, then by score
+        tier_order = {'strong': 0, 'moderate': 1, 'weak': 2}
+        all_analyses.sort(
+            key=lambda x: (tier_order.get(x.get('confidence_tier', 'weak'), 2), -x['score'])
+        )
+
+        print(f"\n✅ Analysis complete! {len(all_analyses)} stocks analysed")
         
         return {
             'market_regime': spy_regime,
@@ -1065,23 +1304,16 @@ class LiveTradingAnalyzer:
         actual_position = shares * current_price
 
         # --- ATR-based dynamic stop loss (2× ATR below entry) ---
-        # Much better than a fixed %, because it adapts to each stock's volatility.
-        # Volatile stocks need wider stops; calm stocks can be tighter.
+        # Reuse the ATR already computed by PredictionEngine — zero extra network calls.
         try:
-            import yfinance as yf
-            _ticker = yf.Ticker(analysis['symbol'])
-            _data = _ticker.history(period='30d')
-            hl = _data['High'] - _data['Low']
-            hc = abs(_data['High'] - _data['Close'].shift())
-            lc = abs(_data['Low'] - _data['Close'].shift())
-            tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-            atr_14 = float(tr.rolling(14).mean().iloc[-1])
-            atr_stop = current_price - (atr_14 * 2.0)   # 2 ATR stop
-            atr_take = current_price + (atr_14 * 4.0)   # 4 ATR target (2:1 RR minimum)
+            atr_14 = float(predictions.get('atr_14') or 0)
+            if atr_14 > 0:
+                atr_stop = current_price - (atr_14 * 2.0)   # 2 ATR stop
+                atr_take = current_price + (atr_14 * 4.0)   # 4 ATR target (2:1 RR minimum)
+            else:
+                atr_14 = atr_stop = atr_take = None
         except Exception:
-            atr_14 = None
-            atr_stop = None
-            atr_take = None
+            atr_14 = atr_stop = atr_take = None
 
         # Fall back to config % if ATR unavailable
         stop_loss_pct = self.config.get('stop_loss_pct', 5) / 100
@@ -1172,12 +1404,18 @@ def load_config():
     
     default_config = {
         'capital': 2400,
-        'position_size_pct': 10,
-        'stop_loss_pct': 5,
-        'take_profit_pct': 10,
-        'enabled_sectors': list(SECTORS.keys()),
-        'top_opportunities': 20,
-        'min_score': 50
+        # 25% per trade → enough dollars to matter but still diversified across 4 positions
+        'position_size_pct': 25,
+        # ATR-based stops are now primary; these are the fallback percentages
+        'stop_loss_pct': 8,
+        'take_profit_pct': 20,
+        # Start with 2 sectors; user can add more once comfortable with analysis time
+        'enabled_sectors': ['Technology', 'Healthcare'],
+        'top_opportunities': 15,
+        # 65 = "good" threshold; 50 gave too many mediocre signals
+        'min_score': 65,
+        # Dynamic tickers off by default; toggle on for live S&P 500 components
+        'use_dynamic_tickers': False,
     }
     
     config_file = 'trading_config.json'

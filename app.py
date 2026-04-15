@@ -667,7 +667,7 @@ HTML_TEMPLATE = """
       <div class="nav-chips">
         <span class="chip chip-regime-unknown" id="regime-chip">Market</span>
         <span class="chip chip-vix-unknown"    id="vix-chip"   style="display:none">VIX</span>
-        <span class="chip chip-win"            id="winrate-chip" style="display:none">—</span>
+        <span class="chip chip-win"            id="winrate-chip" style="display:none;cursor:pointer" onclick="showHistory()">—</span>
         <button class="icon-btn" onclick="openSettings()" title="Settings">⚙</button>
       </div>
     </div>
@@ -697,6 +697,8 @@ HTML_TEMPLATE = """
           <div>
             <div class="decision-ticker" id="d-ticker">—</div>
             <div class="decision-company" id="d-company"></div>
+            <div id="d-confidence-badge" style="display:inline-flex;align-items:center;gap:5px;
+              margin-top:6px;font-size:12px;font-weight:700;padding:3px 10px;border-radius:20px;"></div>
             <div id="d-near-earnings-warn" class="warn-pill" style="display:none;margin:8px 0 0;">
               ⚠ Earnings this week — elevated risk
             </div>
@@ -894,6 +896,29 @@ HTML_TEMPLATE = """
       <div class="sector-grid" id="sector-grid"></div>
     </div>
 
+    <div class="settings-group">
+      <div class="settings-group-title">Data Source</div>
+      <div class="settings-list">
+        <div class="settings-row">
+          <span class="settings-row-label">Live S&amp;P 500 tickers (Wikipedia)</span>
+          <input type="checkbox" id="s-dynamic" style="width:22px;height:22px;accent-color:var(--blue)">
+        </div>
+      </div>
+      <p style="font-size:12px;color:var(--label-2);padding:6px 4px">
+        When on, tickers refresh daily from Wikipedia instead of using the built-in list.
+        Keeps your universe current with index changes.
+      </p>
+    </div>
+
+    <div class="settings-group">
+      <div class="settings-group-title">Trade History</div>
+      <button onclick="closeSettings(); setTimeout(showHistory,200)"
+              style="width:100%;padding:13px;background:var(--gray6);border:1px solid var(--sep);
+                     border-radius:var(--r-md);font-size:15px;cursor:pointer;text-align:left">
+        View &amp; manage win/loss history →
+      </button>
+    </div>
+
     <button class="sheet-save" onclick="saveSettings()">Save Settings</button>
   </div>
 </div>
@@ -926,11 +951,13 @@ async function loadConfig() {
 
 function applyConfigToSheet(c) {
   document.getElementById('s-capital').value   = c.capital            || 2400;
-  document.getElementById('s-position').value  = c.position_size_pct  || 10;
-  document.getElementById('s-stop').value      = c.stop_loss_pct      || 5;
-  document.getElementById('s-profit').value    = c.take_profit_pct    || 10;
-  document.getElementById('s-topn').value      = c.top_opportunities  || 20;
-  document.getElementById('s-minscore').value  = c.min_score          || 50;
+  document.getElementById('s-position').value  = c.position_size_pct  || 25;
+  document.getElementById('s-stop').value      = c.stop_loss_pct      || 8;
+  document.getElementById('s-profit').value    = c.take_profit_pct    || 20;
+  document.getElementById('s-topn').value      = c.top_opportunities  || 15;
+  document.getElementById('s-minscore').value  = c.min_score          || 65;
+  const dynEl = document.getElementById('s-dynamic');
+  if (dynEl) dynEl.checked = !!c.use_dynamic_tickers;
 
   const sectors = {{ sectors | tojson }};
   const grid = document.getElementById('sector-grid');
@@ -952,14 +979,16 @@ function updateCapitalDisplay() {
 async function saveSettings() {
   const sectors = {{ sectors | tojson }};
   const enabled = sectors.filter(s => document.getElementById('sec-'+s)?.checked);
+  const dynEl   = document.getElementById('s-dynamic');
   const newCfg = {
-    capital:            parseInt(document.getElementById('s-capital').value),
-    position_size_pct:  parseInt(document.getElementById('s-position').value),
-    stop_loss_pct:      parseInt(document.getElementById('s-stop').value),
-    take_profit_pct:    parseInt(document.getElementById('s-profit').value),
-    top_opportunities:  parseInt(document.getElementById('s-topn').value),
-    min_score:          parseInt(document.getElementById('s-minscore').value),
-    enabled_sectors:    enabled,
+    capital:             parseInt(document.getElementById('s-capital').value),
+    position_size_pct:   parseInt(document.getElementById('s-position').value),
+    stop_loss_pct:       parseInt(document.getElementById('s-stop').value),
+    take_profit_pct:     parseInt(document.getElementById('s-profit').value),
+    top_opportunities:   parseInt(document.getElementById('s-topn').value),
+    min_score:           parseInt(document.getElementById('s-minscore').value),
+    use_dynamic_tickers: dynEl ? dynEl.checked : false,
+    enabled_sectors:     enabled,
   };
   await fetch('/api/config', {
     method: 'POST',
@@ -1024,6 +1053,20 @@ function renderDecisionCard(data) {
 
   document.getElementById('d-ticker').textContent  = p.symbol;
   document.getElementById('d-company').textContent = p.company_name + ' · ' + p.sector;
+
+  /* Confidence badge */
+  const tier = p.confidence_tier || 'moderate';
+  const badgeEl = document.getElementById('d-confidence-badge');
+  const tierStyles = {
+    strong:   { bg: 'var(--green-light)', color: '#1A7F35', icon: '⬆ Strong Signal' },
+    moderate: { bg: 'var(--blue-light)',  color: 'var(--blue)', icon: '◆ Moderate Signal' },
+    weak:     { bg: 'var(--orange-light)',color: '#BF6900', icon: '⚠ Weak Signal' },
+  };
+  const ts = tierStyles[tier] || tierStyles.moderate;
+  badgeEl.style.background = ts.bg;
+  badgeEl.style.color = ts.color;
+  badgeEl.textContent = ts.icon;
+  badgeEl.style.display = 'inline-flex';
 
   const pill = document.getElementById('d-action-pill');
   pill.textContent = p.action;
@@ -1163,6 +1206,67 @@ function updateWinRateChip(rate, total) {
   const el = document.getElementById('winrate-chip');
   el.textContent = rate.toFixed(0) + '% wins (' + total + ' trades)';
   el.style.display = '';
+}
+
+/* ── Outcome history ── */
+async function showHistory() {
+  const r = await fetch('/api/outcomes');
+  const d = await r.json();
+  if (!d.total_trades) { toast('No trade history yet'); return; }
+
+  const items = d.outcomes.map((o, i) => {
+    const icon = o.outcome === 'win' ? '🟢' : o.outcome === 'loss' ? '🔴' : '⚪';
+    const date = o.timestamp ? o.timestamp.slice(0,10) : '?';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;
+                         padding:10px 14px;border-bottom:1px solid var(--gray5);font-size:14px;">
+      <span>${icon} <strong>${o.symbol}</strong> · ${o.outcome} · ${date}</span>
+      <button onclick="deleteOutcome(${i})" style="background:var(--red-light);color:var(--red);
+              border:none;border-radius:8px;padding:4px 10px;font-size:12px;cursor:pointer;">Delete</button>
+    </div>`;
+  }).join('');
+
+  const panel = document.createElement('div');
+  panel.id = 'history-panel';
+  panel.style.cssText = `position:fixed;inset:0;z-index:300;background:rgba(0,0,0,0.5);
+    display:flex;align-items:flex-end;justify-content:center`;
+  panel.innerHTML = `
+    <div style="background:var(--bg-card);border-radius:24px 24px 0 0;width:100%;
+                max-width:640px;max-height:70dvh;overflow-y:auto;padding-bottom:env(safe-area-inset-bottom,16px)">
+      <div style="padding:16px 20px;display:flex;justify-content:space-between;align-items:center;
+                  border-bottom:1px solid var(--sep)">
+        <strong style="font-size:17px">Trade History</strong>
+        <div style="display:flex;gap:8px">
+          <button onclick="clearAllHistory()" style="background:var(--red-light);color:var(--red);
+                  border:none;border-radius:10px;padding:6px 12px;font-size:13px;font-weight:600;cursor:pointer">
+            Clear All
+          </button>
+          <button onclick="document.getElementById('history-panel').remove()"
+                  style="background:var(--gray5);color:var(--label);border:none;border-radius:10px;
+                         padding:6px 12px;font-size:13px;cursor:pointer">Done</button>
+        </div>
+      </div>
+      ${items}
+    </div>`;
+  panel.addEventListener('click', e => { if (e.target === panel) panel.remove(); });
+  document.body.appendChild(panel);
+}
+
+async function deleteOutcome(idx) {
+  const r = await fetch('/api/outcome/' + idx, { method: 'DELETE' });
+  const d = await r.json();
+  if (d.total_trades >= 0) updateWinRateChip(d.win_rate, d.total_trades);
+  document.getElementById('history-panel')?.remove();
+  await showHistory();
+  toast('Entry deleted');
+}
+
+async function clearAllHistory() {
+  if (!confirm('Delete all trade history? This cannot be undone.')) return;
+  await fetch('/api/outcomes', { method: 'DELETE' });
+  updateWinRateChip(0, 0);
+  document.getElementById('winrate-chip').style.display = 'none';
+  document.getElementById('history-panel')?.remove();
+  toast('History cleared');
 }
 
 /* ── Analyze All ── */
@@ -1400,15 +1504,24 @@ def pick_best():
             )
 
         capital = analyzer.config.get('capital', 2400)
+        opps = latest_results.get('top_opportunities', [])
 
-        # Find the highest-scored BUY; fall back to #1 overall
-        best = None
-        for opp in latest_results.get('top_opportunities', []):
-            if opp.get('predictions', {}).get('action') == 'BUY':
-                best = opp
-                break
-        if best is None and latest_results.get('top_opportunities'):
-            best = latest_results['top_opportunities'][0]
+        # Priority: strong-tier BUY → moderate-tier BUY → any BUY → #1 overall
+        def _find(tier, action=None):
+            for o in opps:
+                tier_ok   = (o.get('confidence_tier') == tier) if tier else True
+                action_ok = (o.get('predictions', {}).get('action') == action) if action else True
+                if tier_ok and action_ok:
+                    return o
+            return None
+
+        best = (_find('strong', 'BUY')
+             or _find('moderate', 'BUY')
+             or _find(None, 'BUY')
+             or (opps[0] if opps else None))
+
+        if best is None:
+            return jsonify({'error': 'No stocks found. Enable more sectors and re-analyze.'}), 404
 
         if best is None:
             return jsonify({'error': 'No stocks found. Enable more sectors and re-analyze.'}), 404
@@ -1451,6 +1564,7 @@ def pick_best():
                 'momentum_1m':      round(best['factors']['momentum']['1m'] * 100, 1),
                 'weekly_trend':     best['factors']['trend'].get('weekly', 'unknown'),
                 'near_earnings':    best.get('near_earnings', False),
+                'confidence_tier':  best.get('confidence_tier', 'moderate'),
                 'rs_vs_spy':        round(best.get('relative_strength_vs_spy', 0) * 100, 1),
                 'max_loss_dollars': max_loss_dollars,
                 'max_gain_dollars': max_gain_dollars,
@@ -1486,15 +1600,7 @@ def record_outcome():
     symbol  = data.get('symbol', 'UNKNOWN')
     outcome = data.get('outcome', 'unknown')  # 'win' | 'loss' | 'breakeven'
 
-    outcomes_file = 'trade_outcomes.json'
-    outcomes = []
-    if os.path.exists(outcomes_file):
-        try:
-            with open(outcomes_file) as f:
-                outcomes = json.load(f)
-        except Exception:
-            outcomes = []
-
+    outcomes = _load_outcomes()
     outcomes.append({
         'symbol':    symbol,
         'outcome':   outcome,
@@ -1502,9 +1608,7 @@ def record_outcome():
         'action':    data.get('action'),
         'timestamp': datetime.now().isoformat(),
     })
-
-    with open(outcomes_file, 'w') as f:
-        json.dump(outcomes, f, indent=2)
+    _save_outcomes(outcomes)
 
     wins  = sum(1 for o in outcomes if o['outcome'] == 'win')
     total = len(outcomes)
@@ -1519,25 +1623,57 @@ def record_outcome():
 @app.route('/api/outcomes', methods=['GET'])
 def get_outcomes():
     """Return win-rate stats and recent trade history."""
-    outcomes_file = 'trade_outcomes.json'
-    outcomes = []
-    if os.path.exists(outcomes_file):
-        try:
-            with open(outcomes_file) as f:
-                outcomes = json.load(f)
-        except Exception:
-            pass
-
+    outcomes = _load_outcomes()
     wins   = sum(1 for o in outcomes if o['outcome'] == 'win')
     losses = sum(1 for o in outcomes if o['outcome'] == 'loss')
     total  = len(outcomes)
     return jsonify({
-        'outcomes':     outcomes[-20:],
+        'outcomes':     outcomes,          # full history with index for deletion
         'win_rate':     round(wins / total * 100, 1) if total else 0,
         'total_trades': total,
         'wins':         wins,
         'losses':       losses,
     })
+
+
+@app.route('/api/outcomes', methods=['DELETE'])
+def clear_all_outcomes():
+    """Delete ALL trade history."""
+    _save_outcomes([])
+    return jsonify({'status': 'cleared', 'win_rate': 0, 'total_trades': 0})
+
+
+@app.route('/api/outcome/<int:idx>', methods=['DELETE'])
+def delete_outcome(idx):
+    """Delete a single outcome entry by its index in the list."""
+    outcomes = _load_outcomes()
+    if idx < 0 or idx >= len(outcomes):
+        return jsonify({'error': 'Index out of range'}), 404
+    outcomes.pop(idx)
+    _save_outcomes(outcomes)
+    wins  = sum(1 for o in outcomes if o['outcome'] == 'win')
+    total = len(outcomes)
+    return jsonify({
+        'status':       'deleted',
+        'win_rate':     round(wins / total * 100, 1) if total else 0,
+        'total_trades': total,
+    })
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+def _load_outcomes() -> list:
+    f = 'trade_outcomes.json'
+    if os.path.exists(f):
+        try:
+            with open(f) as fh:
+                return json.load(fh)
+        except Exception:
+            pass
+    return []
+
+def _save_outcomes(outcomes: list):
+    with open('trade_outcomes.json', 'w') as fh:
+        json.dump(outcomes, fh, indent=2)
 
 # ============================================================================
 # MAIN
