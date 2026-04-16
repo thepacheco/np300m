@@ -1430,9 +1430,10 @@ def analyze():
         log_progress(f'Sectors selected: {len(enabled_sectors)}', 'info')
         
         # Auto-limit on Render to prevent timeout
-        if len(enabled_sectors) > 3:
-            log_progress('⚠️ Limiting to first 3 sectors (free tier)', 'warning')
-            enabled_sectors = enabled_sectors[:3]
+        # Each sector scans 25 stocks; 2 sectors ≈ 50 stocks — safe within 300s
+        if len(enabled_sectors) > 2:
+            log_progress('⚠️ Limiting to first 2 sectors to stay within server timeout', 'warning')
+            enabled_sectors = enabled_sectors[:2]
         
         log_progress(f'Analyzing {len(enabled_sectors)} sectors...', 'info')
         
@@ -1496,8 +1497,8 @@ def pick_best():
         if latest_results is None:
             log_progress('Running analysis for Pick For Me…', 'info')
             enabled_sectors = analyzer.config.get('enabled_sectors', [])
-            if len(enabled_sectors) > 3:
-                enabled_sectors = enabled_sectors[:3]
+            if len(enabled_sectors) > 2:
+                enabled_sectors = enabled_sectors[:2]
             latest_results = analyzer.run_analysis(
                 enabled_sectors=enabled_sectors,
                 top_n=analyzer.config.get('top_opportunities', 20)

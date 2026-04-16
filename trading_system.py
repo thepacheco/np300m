@@ -35,22 +35,53 @@ def _run_with_timeout(fn, timeout: int = 12, default=None):
     t.join(timeout)
     return result[0]
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """Return True if the exception looks like a Yahoo Finance rate-limit error."""
+    msg = str(exc).lower()
+    return 'ratelimit' in msg or 'too many requests' in msg or '429' in msg
+
 def _safe_info(symbol: str, timeout: int = 10) -> dict:
-    """Fetch yfinance .info with timeout + graceful fallback."""
-    def _fetch():
-        return yf.Ticker(symbol).info
-    info = _run_with_timeout(_fetch, timeout=timeout, default={})
-    return info if info else {}
+    """Fetch yfinance .info with timeout + graceful fallback + rate-limit retry."""
+    for attempt in range(3):
+        try:
+            def _fetch():
+                return yf.Ticker(symbol).info
+            info = _run_with_timeout(_fetch, timeout=timeout, default={})
+            return info if info else {}
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                wait = 2 ** attempt * 5  # 5s, 10s, 20s
+                print(f"    ⏳ Rate limit on info({symbol}), retrying in {wait}s…")
+                time.sleep(wait)
+            else:
+                break
+    return {}
 
 def _safe_news(symbol: str, timeout: int = 6) -> list:
-    def _fetch():
-        return yf.Ticker(symbol).news or []
-    return _run_with_timeout(_fetch, timeout=timeout, default=[])
+    for attempt in range(2):
+        try:
+            def _fetch():
+                return yf.Ticker(symbol).news or []
+            return _run_with_timeout(_fetch, timeout=timeout, default=[])
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                time.sleep(5 * (attempt + 1))
+            else:
+                break
+    return []
 
 def _safe_calendar(symbol: str, timeout: int = 8):
-    def _fetch():
-        return yf.Ticker(symbol).calendar
-    return _run_with_timeout(_fetch, timeout=timeout, default=None)
+    for attempt in range(2):
+        try:
+            def _fetch():
+                return yf.Ticker(symbol).calendar
+            return _run_with_timeout(_fetch, timeout=timeout, default=None)
+        except Exception as exc:
+            if _is_rate_limit_error(exc):
+                time.sleep(5 * (attempt + 1))
+            else:
+                break
+    return None
 
 # ============================================================================
 # SECTOR DEFINITIONS - Top 50 stocks per sector
@@ -1046,15 +1077,20 @@ class LiveTradingAnalyzer:
             if prefetched_data is not None and len(prefetched_data) >= 60:
                 data = prefetched_data.copy()
             else:
-                # Individual fallback with 2 retries
+                # Individual fallback with retries and rate-limit handling
                 data = None
                 for attempt in range(3):
                     try:
                         data = yf.Ticker(symbol).history(period='1y')
                         if len(data) >= 60:
                             break
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        if _is_rate_limit_error(exc):
+                            wait = 2 ** attempt * 8  # 8s, 16s, 32s
+                            print(f"    ⏳ Rate limit on history({symbol}), waiting {wait}s…")
+                            time.sleep(wait)
+                        else:
+                            pass
                     time.sleep(0.5 * (attempt + 1))
                 if data is None or len(data) < 60:
                     return None
@@ -1219,37 +1255,47 @@ class LiveTradingAnalyzer:
 
         analyzed_count = 0
         for sector, stocks in sector_stocks.items():
-            symbols = stocks[:50]
+            # Cap at 25 stocks per sector to keep analysis within timeout limits
+            symbols = stocks[:25]
             print(f"  📁 {sector} — batch downloading {len(symbols)} tickers…")
 
             # ── One network round-trip for the whole sector ──────────────
+            # threads=False avoids parallel requests that trigger rate limits
             batch_data: dict = {}
-            try:
-                raw = yf.download(
-                    symbols,
-                    period='1y',
-                    group_by='ticker',
-                    auto_adjust=True,
-                    threads=True,
-                    progress=False,
-                )
-                if not raw.empty:
-                    if len(symbols) == 1:
-                        # Single-ticker download is flat (no ticker level)
-                        sym_df = raw.dropna(subset=['Close'])
-                        if len(sym_df) >= 60:
-                            batch_data[symbols[0]] = sym_df
+            for dl_attempt in range(3):
+                try:
+                    raw = yf.download(
+                        symbols,
+                        period='1y',
+                        group_by='ticker',
+                        auto_adjust=True,
+                        threads=False,
+                        progress=False,
+                    )
+                    if not raw.empty:
+                        if len(symbols) == 1:
+                            # Single-ticker download is flat (no ticker level)
+                            sym_df = raw.dropna(subset=['Close'])
+                            if len(sym_df) >= 60:
+                                batch_data[symbols[0]] = sym_df
+                        else:
+                            for sym in symbols:
+                                try:
+                                    sym_df = raw[sym].dropna(subset=['Close'])
+                                    if len(sym_df) >= 60:
+                                        batch_data[sym] = sym_df
+                                except (KeyError, TypeError):
+                                    pass
+                    print(f"    ✓ Batch loaded {len(batch_data)}/{len(symbols)} stocks")
+                    break  # success
+                except Exception as e:
+                    if _is_rate_limit_error(e):
+                        wait = 2 ** dl_attempt * 10  # 10s, 20s, 40s
+                        print(f"    ⏳ Rate limit on batch download, retrying in {wait}s…")
+                        time.sleep(wait)
                     else:
-                        for sym in symbols:
-                            try:
-                                sym_df = raw[sym].dropna(subset=['Close'])
-                                if len(sym_df) >= 60:
-                                    batch_data[sym] = sym_df
-                            except (KeyError, TypeError):
-                                pass
-                print(f"    ✓ Batch loaded {len(batch_data)}/{len(symbols)} stocks")
-            except Exception as e:
-                print(f"    ⚠ Batch download error ({e}) — will fall back per-stock")
+                        print(f"    ⚠ Batch download error ({e}) — will fall back per-stock")
+                        break
 
             # ── Analyse each stock ────────────────────────────────────────
             for symbol in symbols:
@@ -1264,11 +1310,18 @@ class LiveTradingAnalyzer:
                         if analyzed_count % 20 == 0:
                             print(f"    ✓ Progress: {analyzed_count}/{total_stocks}")
                 except Exception as e:
-                    print(f"    ⚠ Skipping {symbol}: {e}")
+                    if _is_rate_limit_error(e):
+                        print(f"    ⏳ Rate limit hit for {symbol}, pausing 15s…")
+                        time.sleep(15)
+                    else:
+                        print(f"    ⚠ Skipping {symbol}: {e}")
                     continue
 
+                # Gentle throttle between per-stock info calls
+                time.sleep(0.3)
+
             # Brief pause between sectors to be kind to Yahoo Finance
-            time.sleep(1.5)
+            time.sleep(2.0)
 
         # Sort: strong confidence first, then by score
         tier_order = {'strong': 0, 'moderate': 1, 'weak': 2}
